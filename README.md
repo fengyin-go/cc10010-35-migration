@@ -15,7 +15,10 @@
 │   ├── src/views/            每个业务模块一个页面
 │   ├── src/api/local-service.ts   本地数据服务：列表、筛选、动作流转、导出
 │   ├── src/data/             模块元数据 / 示例数据 / localStorage 持久化
-│   ├── src/stores/           会话与筛选状态
+│   │   ├── legacy-storage.ts     升级前的无版本存储（旧结构唯一入口）
+│   │   ├── audit-model.ts        审计版本结构、校验与排序的纯函数
+│   │   └── audit-storage.ts      审计日志迁移、版本化存储、导出队列
+│   ├── scripts/audit-migration.test.ts  迁移回归用例（npm run test:audit）
 │   └── vite.config.ts        dev server 配置（open: false，无 /api 代理）
 ├── .gitignore
 └── docker-compose.yml
@@ -61,6 +64,32 @@ npm run build
 | 资源计量 | `resource` | 计量记录 | 记录编号、计算引擎、作业名称 |
 | 操作审计 | `audit` | 审计日志 | 日志编号、操作类型、操作对象 |
 
+## 审计日志迁移（无版本 → 追加式版本结构）
+
+操作审计日志原先和业务数据共用 `lake-govern-config:entries` 这一份**无版本标记**的本地结构。
+升级后这部分数据迁移到独立的版本化存储 `lake-govern-config:audit-store:v2`，其余模块仍用旧存储。
+
+- 入口：操作审计页面「审计日志存储迁移」面板。可整批执行、单批次步进、失败批次重试/回填。
+- 幂等：每条历史日志用「原数组下标 + 日志编号」作为幂等键，重复执行/从中间续跑都不会多出副本；
+  迁移尽量沿用旧数字编号，只有编号被占用时才分配新号，历史清单仍可对照。
+- 中断续跑：每完成一个批次才推进游标，`active=false` 期间列表、动作和导出仍读旧存储（保持原有流程）；
+  中断期间旧流程产生的状态变化会在续跑时作为新版本追加，不会丢。
+- 损坏隔离：缺编号/缺操作时间/字段不是标量/日志编号重复的记录会进入隔离区，原值原样保留并随导出文件带出；
+  旧存储整体损坏时原文不覆写，按升级前规则回落到示例数据。
+- 归档冻结：`已归档` 日志迁移后只读；其他状态变化以新增版本的方式追加，不覆盖历史版本。
+- 数据源唯一：所有批次成功后先备份旧审计段，再把 `active` 切到 `true`，最后清空旧存储里的审计段；
+  切换之后旧存储不会再被当成当前数据源。
+- 完整导出：`导出操作审计清单` 与跨模块导出队列都读当前数据源，包含迁移前后记录、版本号与隔离记录原值。
+- 兼容报告：页面展示存储版本、旧结构类型、迁移/隔离数量、原归档保留数，以及按存储版本读取的
+  运行环境和构建流水线依赖。
+
+回归用例：
+
+```bash
+cd frontend
+npm run test:audit
+```
+
 ## 约定
 
 - 每个模块的页面在 `frontend/src/views/<模块>/index.vue`，页面只负责渲染，读写统一走
@@ -68,7 +97,8 @@ npm run build
 - 字段、状态、动作与流转目标集中在 `frontend/src/data/modules.ts`；示例数据在
   `frontend/src/data/seed.ts`。
 - 状态流转只允许在 `local-service.ts` 里改，页面组件不做业务判断。
-- 想回到初始数据：清掉浏览器里 `lake-govern-config:entries` 这一项，或调用 `resetModule(模块)`。
+- 想回到初始数据：清掉浏览器里 `lake-govern-config:entries` 这一项，或调用 `resetModule(模块)`；
+  审计日志迁移后由 `lake-govern-config:audit-store:v2` 接管，重置该模块不会清掉已迁移的日志。
 
 领域：数据工程
 子方向：数仓与数据湖

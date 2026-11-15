@@ -1,9 +1,42 @@
 import { MODULE_BY_KEY } from '@/data/modules'
-import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
+import { allRows, invalidateRowsCache, listRows, resetRows, saveRows } from '@/data/local-store'
+import { AUDIT_MODULE_KEY, NEGATIVE_ACTIONS } from '@/data/audit-model'
+import {
+  buildAuditExport,
+  createAuditRecord as createVersionedOrLegacyAudit,
+  runAuditAction,
+} from '@/data/audit-storage'
+import type { AuditCreateInput, AuditCreateResult } from '@/data/audit-storage'
 import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
 
-// 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
-const NEGATIVE_ACTIONS = ['撤销', '作废', '拒绝', '驳回', '停用', '忽略', '下线', '回滚']
+export {
+  auditCompatibilityReport,
+  auditMigrationEnvironment,
+  auditMigrationQueue,
+  auditMigrationState,
+  auditRecordDetail,
+  auditStoreKey,
+  buildAuditExport,
+  enqueueAuditExport,
+  listAuditExportQueue,
+  processAuditExportQueue,
+  retryAuditMigration,
+  retryAuditMigrationBatch,
+  runAuditMigration,
+} from '@/data/audit-storage'
+export type {
+  AuditExportQueueItem,
+  AuditMigrationEnvironment,
+  AuditMigrationRunResult,
+  AuditRecordDetail,
+} from '@/data/audit-storage'
+export type {
+  AuditCompatibilityReport,
+  AuditExportPayload,
+  AuditMigrationQueueItem,
+  AuditMigrationState,
+} from '@/data/audit-model'
+export type { AuditCreateInput, AuditCreateResult }
 
 export function moduleMeta(key: string): ModuleMeta {
   const meta = MODULE_BY_KEY.get(key)
@@ -29,6 +62,12 @@ export function listEntries(key: string, filters: Record<string, string> = {}): 
 }
 
 export function runAction(key: string, id: number, action: string): ActionResult {
+  if (key === AUDIT_MODULE_KEY) {
+    // 审计日志的动作按当前数据源分流：迁移期间走旧流程，迁移完成后走追加式版本结构。
+    const result = runAuditAction(id, action)
+    invalidateRowsCache()
+    return result
+  }
   const meta = moduleMeta(key)
   const target = meta.actionTargets[action]
   if (!target) {
@@ -52,7 +91,14 @@ export function runAction(key: string, id: number, action: string): ActionResult
   }
   const next = [...rows]
   next[index] = updated
-  saveRows(key, next)
+  try {
+    saveRows(key, next)
+  } catch (error) {
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : `${meta.entity}写入本地存储失败`,
+    }
+  }
   return { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
 }
 
@@ -62,6 +108,11 @@ export function resetModule(key: string): PageResult {
 }
 
 export function exportEntries(key: string): { filename: string; content: string } {
+  if (key === AUDIT_MODULE_KEY) {
+    // 审计导出要覆盖新旧记录，并附带隔离记录的原值。
+    const payload = buildAuditExport()
+    return { filename: payload.filename, content: payload.content }
+  }
   const meta = moduleMeta(key)
   const header = ['编号', ...meta.fields, '当前状态']
   const lines = [header.join(',')]
@@ -82,6 +133,14 @@ export function downloadEntries(key: string): void {
   anchor.click()
   document.body.removeChild(anchor)
   URL.revokeObjectURL(url)
+}
+
+export function registerAuditLog(input: AuditCreateInput): AuditCreateResult {
+  const result = createVersionedOrLegacyAudit(input)
+  if (result.ok) {
+    invalidateRowsCache()
+  }
+  return result
 }
 
 export function loadOverview(): OverviewResult {
